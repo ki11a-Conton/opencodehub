@@ -1,0 +1,16 @@
+# Build artifacts (c-shared libraries and the headers cgo emits beside them)
+*.dll
+*.so
+*.dylib
+*.h
+
+# Go
+*.test
+*.out
+/vendor/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

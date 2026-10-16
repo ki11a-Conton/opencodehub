@@ -1,0 +1,60 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: true
+
+      - name: gofmt
+        shell: bash
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -race ./...
+
+      - name: build (c-shared)
+        shell: bash
+        run: |
+          case "${{ runner.os }}" in
+            Windows) ext=dll ;;
+            macOS)   ext=dylib ;;
+            *)       ext=so ;;
+          esac
+          CGO_ENABLED=1 go build -buildmode=c-shared -trimpath -ldflags="-s -w" -o "opencodehub.$ext" .
+          ls -l "opencodehub.$ext"
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencodehub-${{ runner.os }}
+          path: |
+            opencodehub.dll
+            opencodehub.so
+            opencodehub.dylib
+          if-no-files-found: ignore
