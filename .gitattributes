@@ -1,0 +1,18 @@
+# Normalize everything to LF on checkout, on every platform.
+#
+# Without this, cloning on Windows (where Git's default is core.autocrlf=true)
+# rewrites the sources to CRLF and `gofmt -l .` reports every file as
+# unformatted — which is exactly what the CI job checks for.
+* text=auto eol=lf
+
+# Build outputs and binary assets: never touched.
+*.dll   binary
+*.so    binary
+*.dylib binary
+*.zip   binary
+*.png   binary
+*.ico   binary
+
+# Bash scripts must keep LF even if someone overrides the rules above.
+*.sh    text eol=lf
+*.cmd   text eol=crlf

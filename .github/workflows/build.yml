@@ -19,12 +19,13 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26.x'
+          go-version-file: go.mod
           cache: true
 
       - name: gofmt
         shell: bash
         run: |
+          # .gitattributes pins eol=lf so this is meaningful on Windows too.
           unformatted="$(gofmt -l .)"
           if [ -n "$unformatted" ]; then
             echo "these files are not gofmt-clean:"
