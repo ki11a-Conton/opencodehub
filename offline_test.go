@@ -202,3 +202,110 @@ var errDeadProxy = errString("dial tcp 127.0.0.1:59999: connectex: connection re
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+// --- free tier IP block: the egress fallback ------------------------------
+//
+// The free tier refuses whole address ranges, not credentials: a Clash exit on
+// AS31898 answers every free model with 403 FreeTierError while the same request
+// from the local ISP address answers 200 in ~2.4 s. These tests cover the three
+// decisions that fallback is made of — recognising the body, suspending the
+// proxy, and expiring the suspension — without touching the network.
+
+// TestFreeTierBodyDetection: both upstream variants must be recognised, and an
+// unrelated 403 must not be.
+func TestFreeTierBodyDetection(t *testing.T) {
+	fromWithin := []byte(`{"type":"error","error":{"type":"FreeTierError","message":"OpenCode's free tier can only be used from within OpenCode."}}`)
+	fromAddress := []byte(`{"type":"error","error":{"type":"FreeTierError","message":"OpenCode's free models aren't available from your current network because we've detected abusive traffic from this IP address."}}`)
+	other := []byte(`{"error":{"type":"AuthError","message":"invalid key"}}`)
+
+	if !isFreeTierBody(fromWithin) {
+		t.Error("the identity variant was not recognised")
+	}
+	if !isFreeTierBody(fromAddress) {
+		t.Error("the address variant was not recognised")
+	}
+	if isFreeTierBody(other) {
+		t.Error("an unrelated error was mistaken for a free tier block")
+	}
+}
+
+// TestFreeTierBlockSuspendsTheProxy: once marked, no dial may go through the
+// proxy — not through the transport callback, and not through the client the
+// chat path picks.
+func TestFreeTierBlockSuspendsTheProxy(t *testing.T) {
+	original := proxyURL()
+	setLocalProxy(deadProxyPort)
+	clearProxyBlock()
+	t.Cleanup(func() {
+		setLocalProxy(original)
+		clearProxyBlock()
+	})
+
+	if !dialsThroughProxy() {
+		t.Fatal("the proxy should be in use before any block")
+	}
+
+	markProxyBlocked(freeTierCooldown, "test block")
+
+	if dialsThroughProxy() {
+		t.Fatal("the proxy was still in use after a free tier block")
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://"+zenHost+zenChatPath, nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	u, err := proxiedTransport().Proxy(req)
+	if err != nil {
+		t.Fatalf("proxy resolution failed: %v", err)
+	}
+	if u != nil {
+		t.Fatalf("the transport still dials the proxy %v after a block", u)
+	}
+	if got := chatClientFor(); got != directHTTPClient() {
+		t.Fatal("the chat path did not switch to the direct client")
+	}
+}
+
+// TestProxyBlockExpires: the suspension must lift on its own, otherwise one bad
+// minute would pin the operator to direct mode for the rest of the process.
+func TestProxyBlockExpires(t *testing.T) {
+	original := proxyURL()
+	setLocalProxy(deadProxyPort)
+	clearProxyBlock()
+	t.Cleanup(func() {
+		setLocalProxy(original)
+		clearProxyBlock()
+	})
+
+	markProxyBlocked(15*time.Millisecond, "test block")
+	if !proxyEgressBlocked() {
+		t.Fatal("the block was not applied")
+	}
+	time.Sleep(40 * time.Millisecond)
+	if proxyEgressBlocked() {
+		t.Fatal("the block did not expire")
+	}
+	if !dialsThroughProxy() {
+		t.Fatal("the proxy did not come back after the block expired")
+	}
+}
+
+// TestDirectModeIsUnaffectedByBlocks: OPENCODEHUB_PROXY=direct means there is no
+// proxy to suspend, so the fallback bookkeeping must stay out of the way.
+func TestDirectModeIsUnaffectedByBlocks(t *testing.T) {
+	original := proxyURL()
+	setLocalProxy("")
+	clearProxyBlock()
+	t.Cleanup(func() {
+		setLocalProxy(original)
+		clearProxyBlock()
+	})
+
+	markProxyBlocked(freeTierCooldown, "test block")
+	if dialsThroughProxy() {
+		t.Fatal("direct mode started using a proxy")
+	}
+	if got := chatClientFor(); got != directHTTPClient() {
+		t.Fatal("direct mode did not use the direct client")
+	}
+}

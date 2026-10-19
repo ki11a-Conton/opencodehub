@@ -219,15 +219,29 @@ func TestManagementStatusReportsTransport(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		proxy    string
+		blocked  bool
 		expected string
 	}{
 		{name: "proxy configured", proxy: "http://127.0.0.1:7897", expected: "http://127.0.0.1:7897"},
-		{name: "direct mode", proxy: "", expected: "direct (no proxy)"},
+		{name: "direct mode", proxy: "", expected: "direct (no proxy, configured)"},
+		{
+			name:     "proxy suspended by the free tier",
+			proxy:    "http://127.0.0.1:7897",
+			blocked:  true,
+			expected: "direct (proxy suspended: the free tier refused the proxy address)",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			original := proxyURL()
 			setLocalProxy(tc.proxy)
-			t.Cleanup(func() { setLocalProxy(original) })
+			clearProxyBlock()
+			if tc.blocked {
+				markProxyBlocked(freeTierCooldown, "test block")
+			}
+			t.Cleanup(func() {
+				setLocalProxy(original)
+				clearProxyBlock()
+			})
 
 			// The panel resource and the JSON status route share one handler.
 			payload := mustJSON(map[string]any{"Path": "/plugins/" + providerName + "/status"})

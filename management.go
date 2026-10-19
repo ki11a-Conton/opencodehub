@@ -73,7 +73,7 @@ func handleManagement(raw []byte) ([]byte, error) {
 		"auth":      "anonymous (Bearer public)",
 		"models":    ids,
 		"count":     len(ids),
-		"note":      "Models answer while the local proxy is running; with the proxy off they fail with a transport error and CPA startup is unaffected.",
+		"note":      "Models answer while the local proxy is running; if the proxy is down or its address is refused by the free tier, the plugin switches to a direct dial on its own.",
 	})
 	return okEnvelope(mgmtJSONResponse(http.StatusOK, body)), nil
 }

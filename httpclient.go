@@ -1,13 +1,22 @@
 // httpclient.go — the outbound HTTP client for opencode.ai.
 //
-// opencode.ai is only reachable from this machine through the local Clash
-// Verge mixed port, so the client always dials through it. Two properties
-// matter for the "proxy off must not break anything" requirement:
+// opencode.ai is normally reached from here through the local Clash Verge mixed
+// port, which is what OPENCODEHUB_PROXY selects. Two properties matter for the
+// "proxy off must not break anything" requirement:
 //
 //   - the dial has a hard 3 s timeout, so a dead proxy fails fast instead of
 //     hanging the caller;
 //   - nothing here is called during registration, so a dead proxy cannot slow
 //     CPA startup down at all.
+//
+// The third property is newer and is the one that keeps the free tier usable:
+// the egress can be refused for reasons that have nothing to do with this
+// machine's credentials — OpenCode blocks datacenter ranges outright, and a
+// Clash exit on AS31898 answers every free model with 403 FreeTierError while
+// the local ISP address answers in ~2.4 s. That is an address problem, so the
+// reaction is to change address: a refused request suspends the proxy and the
+// next attempt dials direct, without operator action and without editing any
+// launcher script.
 package main
 
 import (
@@ -15,6 +24,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -60,13 +70,56 @@ func proxyURL() string {
 }
 
 // proxyFunc resolves the proxy per request. Returning (nil, nil) means "connect
-// directly", which is how OPENCODEHUB_PROXY=direct is honoured.
+// directly", which is how OPENCODEHUB_PROXY=direct is honoured — and also how the
+// free-tier IP fallback takes effect (see markProxyBlocked).
 func proxyFunc(*http.Request) (*url.URL, error) {
 	raw := proxyURL()
 	if raw == "" {
 		return nil, nil
 	}
+	if proxyEgressBlocked() {
+		return nil, nil
+	}
 	return url.Parse(raw)
+}
+
+// markProxyBlocked suspends the proxy egress and lets the next dial go direct.
+//
+// The free tier blocks whole datacenter ranges rather than individual keys: a
+// Clash exit on AS31898 (Oracle) answers every free model with 403 FreeTierError
+// while the same request from the local ISP address answers 200 in ~2.4 s. The
+// block is not attributable to the plugin, so the useful reaction is to change
+// egress, not to give up.
+func markProxyBlocked(d time.Duration, reason string) {
+	now := time.Now()
+	prev := proxyBlockUntil.Swap(now.Add(d).UnixNano())
+	if prev == 0 || prev <= now.UnixNano() {
+		log.Printf("opencodehub egress: %s — dialing direct for %s", reason, d)
+	}
+}
+
+// proxyEgressBlocked reports whether the proxy is currently suspended in favour
+// of a direct connection.
+func proxyEgressBlocked() bool {
+	until := proxyBlockUntil.Load()
+	return until != 0 && time.Now().UnixNano() < until
+}
+
+// clearProxyBlock lifts the suspension. Tests use it; a cooldown expiring is
+// what clears it in production.
+func clearProxyBlock() { proxyBlockUntil.Store(0) }
+
+// dialsThroughProxy reports whether the next request will actually use the
+// proxy. False means either the operator asked for direct mode, or the fallback
+// is active.
+func dialsThroughProxy() bool { return proxyURL() != "" && !proxyEgressBlocked() }
+
+// isFreeTierBody reports whether an upstream body carries the free tier's
+// identity error. Only the type marker is checked: the surrounding message
+// differs between the two variants ("only from within OpenCode" vs "abusive
+// traffic from this IP").
+func isFreeTierBody(body []byte) bool {
+	return bytes.Contains(body, []byte("FreeTierError"))
 }
 
 // setLocalProxy repoints outbound traffic. Tests use it to simulate a
@@ -75,10 +128,14 @@ func setLocalProxy(u string) { localProxy.Store(u) }
 
 // transportLabel describes the egress path for humans (management panel, logs).
 func transportLabel() string {
-	if raw := proxyURL(); raw != "" {
-		return raw
+	raw := proxyURL()
+	if raw == "" {
+		return "direct (no proxy, configured)"
 	}
-	return "direct (no proxy)"
+	if proxyEgressBlocked() {
+		return "direct (proxy suspended: the free tier refused the proxy address)"
+	}
+	return raw
 }
 
 const (
@@ -102,11 +159,27 @@ const (
 	zenMaxAttempts = 3
 	// zenRetryBackoff is the base delay between attempts (grows linearly).
 	zenRetryBackoff = 400 * time.Millisecond
+	// freeTierCooldown is how long a FreeTierError keeps the proxy suspended.
+	// The upstream block is keyed on the exit address, which changes only when
+	// the operator switches nodes, so re-probing sooner buys nothing and costs
+	// a round trip per chat call.
+	freeTierCooldown = 10 * time.Minute
+	// proxyDownCooldown is how long a transport-level failure keeps the proxy
+	// suspended. Shorter than freeTierCooldown because a switched-off Clash is
+	// a local, usually transient condition.
+	proxyDownCooldown = 5 * time.Minute
 )
+
+// proxyBlockUntil holds the unix-nano instant at which the proxy suspension
+// lifts; 0 means "not suspended". Kept as a plain atomic int64 so the transport's
+// per-dial Proxy callback stays lock-free.
+var proxyBlockUntil atomic.Int64
 
 var (
 	clientOnce        sync.Once
 	client            *http.Client
+	directClientOnce  sync.Once
+	directClient      *http.Client
 	catalogClientOnce sync.Once
 	catalogClient     *http.Client
 )
@@ -138,6 +211,34 @@ func httpClient() *http.Client {
 		client = &http.Client{Timeout: zenRequestTimeout, Transport: proxiedTransport()}
 	})
 	return client
+}
+
+// directTransport is the same transport with the proxy removed entirely. It is a
+// separate transport rather than a flag because a *http.Transport caches live
+// connections per dial path: reusing the proxied transport's pool after a
+// fallback would keep sending CONNECT through the blocked exit.
+func directTransport() *http.Transport {
+	t := proxiedTransport()
+	t.Proxy = nil
+	return t
+}
+
+// directHTTPClient returns the client used once the proxy egress is suspended.
+func directHTTPClient() *http.Client {
+	directClientOnce.Do(func() {
+		directClient = &http.Client{Timeout: zenRequestTimeout, Transport: directTransport()}
+	})
+	return directClient
+}
+
+// chatClientFor returns the client the next attempt should use: the proxied one
+// while the proxy is healthy (or explicitly configured), the direct one once a
+// fallback is in effect.
+func chatClientFor() *http.Client {
+	if dialsThroughProxy() {
+		return httpClient()
+	}
+	return directHTTPClient()
 }
 
 // catalogHTTPClient returns the client used for the model catalog. It shares the
@@ -186,15 +287,20 @@ func zenGet(path string) ([]byte, error) {
 // hanging to the client's 90 s timeout before this existed). Each attempt
 // rebuilds the whole request with a fresh session and message id, so a retry is
 // never a byte-identical replay of the attempt that just failed.
+//
+// A 403 FreeTierError is handled separately from a stall: it means the current
+// egress address is refused, so the proxy is suspended and the very next attempt
+// dials direct instead of replaying the same doomed path.
 func zenChatStream(ctx context.Context, body []byte) (*http.Response, error) {
 	var lastErr error
 	for attempt := 1; attempt <= zenMaxAttempts; attempt++ {
+		proxied := dialsThroughProxy()
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+zenHost+zenChatPath, bytes.NewReader(body))
 		if err != nil {
 			return nil, err
 		}
 		req.Header = zenHeaders(body, ocSessionID())
-		resp, err := httpClient().Do(req)
+		resp, err := chatClientFor().Do(req)
 		if err == nil && resp.StatusCode == http.StatusOK {
 			return resp, nil
 		}
@@ -204,6 +310,13 @@ func zenChatStream(ctx context.Context, body []byte) (*http.Response, error) {
 			rawErr, _ := io.ReadAll(io.LimitReader(resp.Body, errorBodyLimit))
 			resp.Body.Close()
 			lastErr = fmt.Errorf("upstream http %d: %s", resp.StatusCode, truncateBody(rawErr))
+			if resp.StatusCode == http.StatusForbidden && proxied && isFreeTierBody(rawErr) {
+				// Not this plugin's fault: the exit address is refused. Change
+				// egress and immediately retry — no backoff, the request itself
+				// is fine.
+				markProxyBlocked(freeTierCooldown, "free tier refused the proxy address")
+				continue
+			}
 			if !retryableStatus(resp.StatusCode) {
 				return nil, lastErr
 			}
@@ -212,6 +325,12 @@ func zenChatStream(ctx context.Context, body []byte) (*http.Response, error) {
 			// A cancelled client request is not worth retrying.
 			if ctx.Err() != nil {
 				return nil, lastErr
+			}
+			if proxied {
+				// A refused/dropped dial through the local proxy is the other
+				// way this plugin loses its egress (Clash closed). Fall back
+				// the same way a refused request does.
+				markProxyBlocked(proxyDownCooldown, "proxy dial failed")
 			}
 		}
 		if attempt < zenMaxAttempts {
@@ -226,13 +345,13 @@ func zenChatStream(ctx context.Context, body []byte) (*http.Response, error) {
 }
 
 // retryableStatus reports whether another attempt can plausibly succeed.
-// 403 is the free tier's "only from within OpenCode" identity check. This plugin
-// should never earn one — declaring the `read` tool plus the x-opencode-* header
-// family is what satisfies that gate (see README) — so a 403 arriving here means
-// either the body was rewritten in a way that dropped `read`, or upstream moved
-// the goalposts. A single fresh attempt is cheap in both cases. 429 and 5xx are
-// transient by definition. A 400/404/410 means the request or the model itself
-// is wrong: retrying would only burn the client's time.
+// 403 is the free tier's identity/address check. The address variant is handled
+// before this is consulted (the proxy is suspended and the next attempt dials
+// direct); what reaches here is the "only from within OpenCode" variant, which
+// this plugin satisfies by declaring the `read` tool plus the x-opencode-*
+// header family (see README). A single fresh attempt is cheap in that case.
+// 429 and 5xx are transient by definition. A 400/404/410 means the request or
+// the model itself is wrong: retrying would only burn the client's time.
 func retryableStatus(code int) bool {
 	switch {
 	case code == http.StatusForbidden:

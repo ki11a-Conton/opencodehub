@@ -2,6 +2,33 @@
 
 本文件记录 opencodehub 的主要变更。格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.1.2] — 2026-10-19
+
+出口被拒时的自愈。上游按**地址段**而不是按账号封禁免费档，插件原先对此毫无办法 —— 只能靠运维在启动脚本里写死 `OPENCODEHUB_PROXY=direct`。这一版把这件事收进插件内部。
+
+### 修复
+
+- **免费档按 IP 封禁时自动改走直连**。Clash 出口落在 AS31898（Oracle 斯德哥尔摩）时，10 个免费模型全部返回
+  `403 FreeTierError:...abusive traffic from this IP address`；同一请求从家宽地址发出则 200 / 2.42 秒。
+  现在聊天路径会在收到 `403` + `FreeTierError` 后挂起代理出口 10 分钟，**紧接着的那次重试直接拨号**，
+  不给运维留任何手工动作，也不必再改启动脚本。
+- **代理进程不在时同样自动直连**。经代理的拨号失败（Clash 关闭、端口改了）会挂起代理 5 分钟并改走直连，
+  顺带把"代理关掉就必须手工切 direct"这条老规矩也去掉了。
+- 免费档两种 403 措辞（`only from within OpenCode` / `abusive traffic from this IP`）都识别，
+  判据只看 `FreeTierError` 类型标记；其它 403 不触发出口切换。
+
+### 变更
+
+- 插件版本 `0.1.1` → `0.1.2`。
+- 管理面板 `transport` 字段会如实反映当前出口：代理正常时是代理地址，挂起时是
+  `direct (proxy suspended: the free tier refused the proxy address)`。
+- 新增 4 个用例（`TestFreeTierBodyDetection`、`TestFreeTierBlockSuspendsTheProxy`、
+  `TestProxyBlockExpires`、`TestDirectModeIsUnaffectedByBlocks`），测试总数 26 → 30。
+
+### 说明
+
+- `OPENCODEHUB_PROXY=direct` 仍然有效，且优先级更高：写死直连后不会再有任何代理尝试，也不会有那一次探测性的 403。
+
 ## [0.1.1] — 2026-10-19
 
 针对上游免费档收紧的一次集中修复。三个问题都来自真实调用日志，不是纸面推演。
