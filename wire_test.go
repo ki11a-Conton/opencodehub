@@ -309,6 +309,9 @@ func TestAggregateCompletion(t *testing.T) {
 		t.Errorf("finish_reason = %v, want stop", choice["finish_reason"])
 	}
 	msg := choice["message"].(map[string]any)
+	if msg["role"] != "assistant" {
+		t.Errorf("role = %q, want assistant", msg["role"])
+	}
 	if msg["content"] != "Hello there friend" {
 		t.Errorf("content = %v, want %q", msg["content"], "Hello there friend")
 	}
@@ -321,6 +324,37 @@ func TestAggregateCompletion(t *testing.T) {
 	}
 	if _, ok := usage["completion_tokens_details"]; !ok {
 		t.Errorf("reasoning token details were dropped: %v", usage)
+	}
+}
+
+// TestAggregateCompletionRepeatedRole guards against the upstream habit of
+// stamping "role":"assistant" on every SSE frame. Concatenating it produced
+// "assistantassistantassistant…" as the final role (observed live with
+// deepseek-v4.1-flash-free, where a 9-frame answer returned a 81-char role).
+func TestAggregateCompletionRepeatedRole(t *testing.T) {
+	sse := strings.Join([]string{
+		`data: {"id":"x","model":"deepseek-v4.1-flash-free","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}`,
+		`data: {"id":"x","model":"deepseek-v4.1-flash-free","choices":[{"index":0,"delta":{"role":"assistant","content":"O"}}]}`,
+		`data: {"id":"x","model":"deepseek-v4.1-flash-free","choices":[{"index":0,"delta":{"role":"assistant","content":"K"}}]}`,
+		`data: {"id":"x","model":"deepseek-v4.1-flash-free","choices":[{"index":0,"finish_reason":"stop","delta":{"role":"assistant","content":""}}]}`,
+		`data: [DONE]`,
+	}, "\n")
+
+	body, err := aggregateCompletion(strings.NewReader(sse), "deepseek-v4.1-flash-free", newToolMapper(nil))
+	if err != nil {
+		t.Fatalf("aggregateCompletion: %v", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("decode completion: %v", err)
+	}
+	msg := out["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if msg["role"] != "assistant" {
+		t.Errorf("role = %q (len %d), want assistant — repeated role frames must not accumulate",
+			msg["role"], len(msg["role"].(string)))
+	}
+	if msg["content"] != "OK" {
+		t.Errorf("content = %v, want OK", msg["content"])
 	}
 }
 

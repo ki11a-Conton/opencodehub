@@ -385,7 +385,10 @@ func aggregateCompletion(r io.Reader, model string, mapper *toolMapper) ([]byte,
 			if !ok {
 				continue
 			}
-			if v, _ := delta["role"].(string); v != "" {
+			// The upstream repeats "role":"assistant" on every frame, so this
+			// must keep the first non-empty value — appending turns nine
+			// frames into "assistantassistantassistant…".
+			if v, _ := delta["role"].(string); v != "" && role.Len() == 0 {
 				role.WriteString(v)
 			}
 			if v, _ := delta["content"].(string); v != "" {

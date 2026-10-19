@@ -81,7 +81,7 @@ const (
 	// providerName is the CPA-facing provider id, and the plugin id (the
 	// plugins.configs key and the DLL base name must match it).
 	providerName  = "opencodehub"
-	pluginVersion = "0.1.0"
+	pluginVersion = "0.1.1"
 	// pluginLogo is empty: the host renders its default mark.
 	pluginLogo = ""
 )

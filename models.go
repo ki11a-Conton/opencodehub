@@ -45,19 +45,58 @@ var zenFreeModels = []zenFreeModel{
 	{ID: "deepseek-v4.1-flash-free", DisplayName: "DeepSeek v4.1 Flash (free)", Context: 262144, MaxOutput: 32768},
 	{ID: "nemotron-3.5-lightning-free", DisplayName: "Nemotron 3.5 Lightning (free)", Context: 262144, MaxOutput: 32768},
 	{ID: "nemotron-3.5-super-vl-free", DisplayName: "Nemotron 3.5 Super VL (free)", Context: 262144, MaxOutput: 32768},
+	{ID: "longcat-2.5-preview-free", DisplayName: "LongCat 2.5 Preview (free)", Context: 262144, MaxOutput: 32768},
+	{ID: "space-bunny-free", DisplayName: "Space Bunny (free)", Context: 262144, MaxOutput: 32768},
+	{ID: "beam-free", DisplayName: "Beam (free)", Context: 262144, MaxOutput: 32768},
+	{ID: "glm-5.3-flash-free", DisplayName: "GLM 5.3 Flash (free)", Context: 262144, MaxOutput: 32768},
+}
+
+// zenRetiredModels are ids this plugin still owns but must never advertise:
+// upstream answers them with a hard error, so publishing them only hands the
+// client a model that cannot be called.
+//
+// Verified against /zen/v1/chat/completions on 2026-10-19:
+//
+//	muse-spark-1.2-contributor-free   HTTP 410 ModelDeprecated
+//	muse-spark-1.3-contributor-free   HTTP 410 ModelDeprecated
+//	step-5-preview-free               HTTP 400 server_error: Model is unavailable.
+//	jev-1.13-free                     HTTP 400 ModelProtocolUnsupported
+//
+// The two muse-spark ids and step-5-preview-free also disappeared from
+// /zen/v1/models. jev-1.13-free is still listed there, but it only answers on a
+// protocol other than chat completions and this plugin declares
+// chat-completions as its sole executor format (plugin.go ExecutorInputFormats),
+// so it cannot be served from here.
+//
+// Ownership is deliberately kept: a client that hardcodes a retired id then gets
+// the upstream's own explanation instead of the host's auth_unavailable
+// fallthrough, and a catalog refresh cannot silently resurrect the id.
+var zenRetiredModels = []zenFreeModel{
 	{ID: "muse-spark-1.2-contributor-free", DisplayName: "Muse Spark 1.2 (free)", Context: 262144, MaxOutput: 32768},
 	{ID: "muse-spark-1.3-contributor-free", DisplayName: "Muse Spark 1.3 (free)", Context: 262144, MaxOutput: 32768},
 	{ID: "step-5-preview-free", DisplayName: "Step 5 Preview (free)", Context: 262144, MaxOutput: 32768},
-	{ID: "longcat-2.5-preview-free", DisplayName: "LongCat 2.5 Preview (free)", Context: 262144, MaxOutput: 32768},
-	{ID: "space-bunny-free", DisplayName: "Space Bunny (free)", Context: 262144, MaxOutput: 32768},
 	{ID: "jev-1.13-free", DisplayName: "Jev 1.13 (free)", Context: 262144, MaxOutput: 32768},
 }
 
+// zenRetiredSet is the membership test that keeps a catalog refresh from
+// pulling a retired id back into the published list.
+var zenRetiredSet = func() map[string]struct{} {
+	out := make(map[string]struct{}, len(zenRetiredModels))
+	for _, m := range zenRetiredModels {
+		out[m.ID] = struct{}{}
+	}
+	return out
+}()
+
 // zenModelSet is the lookup used by the router to decide whether a request
-// belongs to this plugin.
+// belongs to this plugin. Retired ids are included: ownership and advertising
+// are separate concerns.
 var zenModelSet = func() map[string]struct{} {
-	out := make(map[string]struct{}, len(zenFreeModels))
+	out := make(map[string]struct{}, len(zenFreeModels)+len(zenRetiredModels))
 	for _, m := range zenFreeModels {
+		out[m.ID] = struct{}{}
+	}
+	for _, m := range zenRetiredModels {
 		out[m.ID] = struct{}{}
 	}
 	return out
@@ -178,9 +217,19 @@ func refreshCatalog() {
 }
 
 // parseZenCatalog extracts the free-tier ids from a /zen/v1/models payload.
-// Newly released free-tier ids are appended to the compiled-in list so they
-// show up without a rebuild; ids that disappear upstream are kept, because an
-// upstream outage must never shrink the published list.
+//
+// Merge policy — union, not intersection:
+//
+//   - Newly released free-tier ids are appended to the compiled-in list so they
+//     show up without a rebuild.
+//   - Compiled ids missing from the payload are kept. Presence in /zen/v1/models
+//     is not a retirement oracle: cat-jam-free is absent from that listing and
+//     still answers chat completions. Dropping unlisted ids would therefore hide
+//     working models every time upstream's listing lags.
+//   - Retirement is decided by evidence, not by absence: an id that upstream
+//     rejects with 410 ModelDeprecated, "Model is unavailable" or
+//     ModelProtocolUnsupported moves to zenRetiredModels and is filtered here so
+//     a later catalog cannot put it back in front of the client.
 func parseZenCatalog(raw []byte) ([]zenFreeModel, error) {
 	var payload struct {
 		Data []struct {
@@ -202,6 +251,9 @@ func parseZenCatalog(raw []byte) ([]zenFreeModel, error) {
 	for _, item := range payload.Data {
 		id := strings.TrimSpace(item.ID)
 		if id == "" || seen[id] || !isFreeTierID(id) {
+			continue
+		}
+		if _, retired := zenRetiredSet[id]; retired {
 			continue
 		}
 		seen[id] = true
